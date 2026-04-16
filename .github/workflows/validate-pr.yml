@@ -26,7 +26,7 @@ jobs:
       keys_path: ${{ steps.classify.outputs.keys_path }}
     steps:
       - name: Check out PR head with history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -165,10 +165,10 @@ jobs:
     if: needs.detect_submission_type.outputs.keys_path != ''
     steps:
       - name: Check out PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -329,13 +329,13 @@ jobs:
     if: needs.detect_submission_type.outputs.pack_path != ''
     steps:
       - name: Check out PR head with submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
           lfs: true
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 

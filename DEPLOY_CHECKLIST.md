@@ -115,36 +115,113 @@ enough — no `repo:*` on the whole account.
 
 ---
 
-## Section 5 — Branch protection
+## Section 5 — Branch protection (repo-level ruleset, evaluate mode)
 
-- [ ] **5.1** Require all five validation jobs to pass before merge.
+GitHub's classic branch protection API silently fails when a bot
+needs to push directly to `main` (the rebuild-index workflow's
+case): the four required PR-context status checks never run on
+direct pushes, so they remain "expected" forever and block the
+push. Repo-level rulesets have the same problem because they
+cannot list `GitHub Actions` as a bypass actor — only org-level
+rulesets can.
+
+**Org-level rulesets require GitHub Team plan ($4/user/mo).**
+On Free orgs the API returns
+`Upgrade to GitHub Team to enable this feature. (HTTP 403)` for
+`POST /orgs/{org}/rulesets`.
+
+The workaround that ships in this checklist: a repo-level
+ruleset in **`enforcement: "evaluate"` mode**. The four required
+checks still appear on every PR (devs see green/red, the bot
+comments still post and label), but the ruleset does NOT block
+the bot's direct push. Trade-off: an org admin can technically
+merge a failing PR via API. Acceptable for solo or small-team
+deployments; revisit on Team upgrade.
+
+- [ ] **5.1** Create the repo-level ruleset.
   ```bash
-  gh api repos/YOUR_ORG/kbtransfer-registry/branches/main/protection \
-    --method PUT \
-    --field required_status_checks='{"strict":true,"contexts":[
-        "check_single_file",
-        "detect_submission_type",
-        "validate_publisher",
-        "validate_pack",
-        "auto_merge"
-      ]}' \
-    --field enforce_admins=false \
-    --field required_pull_request_reviews=null \
-    --field restrictions=null
+  gh api repos/YOUR_ORG/kbtransfer-registry/rulesets \
+    --method POST \
+    --input - <<'EOF'
+  {
+    "name": "main-protection-evaluate",
+    "target": "branch",
+    "enforcement": "evaluate",
+    "conditions": {
+      "ref_name": {
+        "include": ["refs/heads/main"],
+        "exclude": []
+      }
+    },
+    "bypass_actors": [
+      {
+        "actor_id": 1,
+        "actor_type": "OrganizationAdmin",
+        "bypass_mode": "always"
+      }
+    ],
+    "rules": [
+      {"type": "deletion"},
+      {"type": "non_fast_forward"},
+      {
+        "type": "required_status_checks",
+        "parameters": {
+          "strict_required_status_checks_policy": true,
+          "required_status_checks": [
+            {"context": "check_single_file"},
+            {"context": "detect_submission_type"},
+            {"context": "validate_publisher"},
+            {"context": "validate_pack"}
+          ]
+        }
+      }
+    ]
+  }
+  EOF
   ```
+
+  Notes on the JSON:
+  - `enforcement: "evaluate"` — reports check status, does not
+    block. Switch to `"active"` after upgrading to Team plan
+    (and add a `GitHub Actions` bypass actor — see below).
+  - `auto_merge` is intentionally NOT in the required list —
+    it sleeps 30 min and would force every PR to wait that long
+    before any required-check could complete.
+  - `bypass_actors` includes only `OrganizationAdmin` so admins
+    can merge or push when the bot can't. The bot itself doesn't
+    need a bypass entry under `evaluate` mode.
 
   Context names must exactly match the top-level `jobs:` keys in
   `validate-pr.yml`. Verify with:
   ```bash
-  grep "^  [a-z]" .github/workflows/validate-pr.yml | grep "id:"
+  grep -E "^  [a-z_]+:" .github/workflows/validate-pr.yml
   ```
 
-- [ ] **5.2** Confirm protection is active.
+- [ ] **5.2** Confirm the ruleset is active.
   ```bash
-  gh api repos/YOUR_ORG/kbtransfer-registry/branches/main \
-    --jq '.protection.required_status_checks.contexts'
+  gh api repos/YOUR_ORG/kbtransfer-registry/rulesets \
+    --jq '.[] | {id, name, enforcement, target}'
   ```
-  Expected output: a JSON array matching the five job names above.
+  Expected output: one entry with `enforcement: "evaluate"` and
+  `name: "main-protection-evaluate"`.
+
+- [ ] **5.3** _After upgrading to Team plan (optional)._ Replace
+  the repo-level ruleset with an org-level one in `active` mode
+  with a `GitHub Actions` bypass actor:
+  ```bash
+  # Delete the repo-level ruleset:
+  gh api repos/YOUR_ORG/kbtransfer-registry/rulesets/<RULESET_ID> \
+    --method DELETE
+
+  # Create the org-level ruleset (requires admin:org scope —
+  # run `gh auth refresh -h github.com -s admin:org` first):
+  gh api orgs/YOUR_ORG/rulesets --method POST --input - <<'EOF'
+  { ... same body as 5.1 but enforcement: "active" and add to
+        bypass_actors:
+        {"actor_id": 15368, "actor_type": "Integration",
+         "bypass_mode": "always"} ... }
+  EOF
+  ```
 
 ---
 
