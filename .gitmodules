@@ -1,4 +1,0 @@
-[submodule "kbtransfer"]
-	path = kbtransfer
-	url = https://github.com/your-org/KBTRANSFER.git
-	branch = main
