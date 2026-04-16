@@ -1,0 +1,575 @@
+name: Validate PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "packs/**"
+      - "publishers/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  PR_REPO: ${{ github.repository }}
+
+jobs:
+  # ── Job 1 ────────────────────────────────────────────────────────────
+  check_single_file:
+    name: Check PR scope (1 or 2 allowed files)
+    runs-on: ubuntu-latest
+    outputs:
+      pack_path: ${{ steps.classify.outputs.pack_path }}
+      keys_path: ${{ steps.classify.outputs.keys_path }}
+    steps:
+      - name: Check out PR head with history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Diff against base branch
+        id: diff
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+          {
+            echo "files<<__KBT_EOF__"
+            git diff --name-only "origin/${{ github.base_ref }}"...HEAD | sort
+            echo "__KBT_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Classify changed files
+        id: classify
+        env:
+          FILES: ${{ steps.diff.outputs.files }}
+        run: |
+          mkdir -p .ci-artifacts
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          files = [ln for ln in os.environ.get("FILES", "").splitlines() if ln.strip()]
+          pack_re = re.compile(r"^packs/[^/]+-\d+\.\d+\.\d+\.tar$")
+          keys_re = re.compile(r"^publishers/[^/]+/keys\.json$")
+          pack_files = [f for f in files if pack_re.match(f)]
+          keys_files = [f for f in files if keys_re.match(f)]
+          other = [f for f in files if f not in pack_files and f not in keys_files]
+
+          reason = ""
+          if len(files) == 1:
+              if len(pack_files) == 1 or len(keys_files) == 1:
+                  pass
+              else:
+                  reason = (
+                      "A single-file PR must change either one "
+                      "`packs/<pack_id>-<version>.tar` **or** one "
+                      "`publishers/<did_safe>/keys.json`."
+                  )
+          elif len(files) == 2:
+              if len(pack_files) == 1 and len(keys_files) == 1 and not other:
+                  pass
+              else:
+                  reason = (
+                      "A two-file PR must change exactly one "
+                      "`publishers/<did_safe>/keys.json` and one "
+                      "`packs/<pack_id>-<version>.tar` — nothing else."
+                  )
+          else:
+              reason = (
+                  f"Every PR to this registry must change exactly 1 or 2 "
+                  f"allowed files; this PR changes {len(files)}."
+              )
+
+          if reason:
+              body_lines = [
+                  "## ✗ KBTransfer Registry Bot — Invalid submission",
+                  "",
+                  reason,
+                  "",
+                  "**Allowed changes per PR:**",
+                  "- 1 file: either `packs/<pack_id>-<version>.tar` or "
+                  "`publishers/<did_safe>/keys.json`",
+                  "- 2 files: exactly one of each (a publisher registration "
+                  "bundled with their first pack)",
+                  "",
+                  "**Changed files in this PR:**",
+              ]
+              if files:
+                  body_lines.extend(f"- `{f}`" for f in files)
+              else:
+                  body_lines.append("_(none detected)_")
+              body_lines.extend([
+                  "",
+                  "Split unrelated changes into separate PRs, then re-push.  ",
+                  "See [REGISTRY_POLICY.md](./REGISTRY_POLICY.md) for the full "
+                  "submission rules.",
+              ])
+              with open(".ci-artifacts/invalid_body.md", "w") as fh:
+                  fh.write("\n".join(body_lines))
+              print("\n".join(body_lines))
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"pack_path={pack_files[0] if pack_files else ''}\n")
+              fh.write(f"keys_path={keys_files[0] if keys_files else ''}\n")
+          PY
+
+      - name: Post invalid-submission comment and label
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f .ci-artifacts/invalid_body.md ]; then
+            gh pr comment "$PR_NUMBER" --repo "$PR_REPO" \
+              --body-file .ci-artifacts/invalid_body.md
+          fi
+          gh pr edit "$PR_NUMBER" --repo "$PR_REPO" \
+            --add-label "invalid-submission" || true
+
+  # ── Job 2 ────────────────────────────────────────────────────────────
+  detect_submission_type:
+    name: Detect submission type
+    runs-on: ubuntu-latest
+    needs: check_single_file
+    outputs:
+      type: ${{ steps.resolve.outputs.type }}
+      pack_path: ${{ needs.check_single_file.outputs.pack_path }}
+      keys_path: ${{ needs.check_single_file.outputs.keys_path }}
+    steps:
+      - name: Resolve submission type
+        id: resolve
+        env:
+          PACK_PATH: ${{ needs.check_single_file.outputs.pack_path }}
+          KEYS_PATH: ${{ needs.check_single_file.outputs.keys_path }}
+        run: |
+          if [ -n "$PACK_PATH" ]; then
+            # A PR that touches a .tar is always treated as a pack
+            # submission. If a keys.json is bundled (2-file PR), the
+            # validate_publisher job still fires in parallel because
+            # its `if:` gates on keys_path presence, not on this type.
+            echo "type=pack_submission" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=publisher_registration" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Job 3 ────────────────────────────────────────────────────────────
+  validate_publisher:
+    name: Validate publisher registration
+    runs-on: ubuntu-latest
+    needs: detect_submission_type
+    # Runs whenever the PR changes a keys.json — covers both the
+    # "keys.json only" case and the "keys.json + first pack" case.
+    if: needs.detect_submission_type.outputs.keys_path != ''
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate keys.json schema
+        id: validate
+        env:
+          KEYS_PATH: ${{ needs.detect_submission_type.outputs.keys_path }}
+        run: |
+          mkdir -p .ci-artifacts
+          python - <<'PY'
+          import base64
+          import binascii
+          import json
+          import os
+          import re
+          import sys
+
+          path = os.environ["KEYS_PATH"]
+          errors: list[str] = []
+          doc = None
+
+          try:
+              with open(path, "r", encoding="utf-8") as fh:
+                  doc = json.load(fh)
+          except FileNotFoundError:
+              errors.append(f"`{path}` does not exist")
+          except json.JSONDecodeError as exc:
+              errors.append(f"`{path}` is not valid JSON: {exc}")
+
+          def did_safe(did: str) -> str:
+              # Registry convention documented in REGISTRY_POLICY.md:
+              # `:` and `/` both map to `_`. Encoding is lossy by design,
+              # so we verify by re-encoding the `did` field and comparing
+              # the result against the directory name.
+              return did.replace(":", "_").replace("/", "_")
+
+          dir_match = re.match(r"^publishers/([^/]+)/keys\.json$", path)
+          dir_name = dir_match.group(1) if dir_match else None
+
+          did_value = None
+          keys_list: list[dict] = []
+          if isinstance(doc, dict):
+              if "did" not in doc:
+                  errors.append("keys.json is missing required field `did`")
+              else:
+                  did_value = doc["did"]
+                  if not isinstance(did_value, str) or not did_value.strip():
+                      errors.append("`did` must be a non-empty string")
+                      did_value = None
+
+              keys_field = doc.get("keys")
+              if keys_field is None:
+                  errors.append("keys.json is missing required field `keys`")
+              elif not isinstance(keys_field, list) or not keys_field:
+                  errors.append("`keys` must be a non-empty array")
+              else:
+                  keys_list = keys_field
+          elif doc is not None:
+              errors.append("keys.json must parse to a JSON object")
+
+          for i, key in enumerate(keys_list):
+              if not isinstance(key, dict):
+                  errors.append(f"keys[{i}] must be an object")
+                  continue
+              key_id = key.get("key_id")
+              if not isinstance(key_id, str) or not key_id.strip():
+                  errors.append(f"keys[{i}].key_id must be a non-empty string")
+              algorithm = key.get("algorithm")
+              if algorithm != "Ed25519":
+                  errors.append(
+                      f"keys[{i}].algorithm must equal `Ed25519` "
+                      f"(got {algorithm!r})"
+                  )
+              pub_b64 = key.get("public_key_b64")
+              if not isinstance(pub_b64, str) or not pub_b64.strip():
+                  errors.append(
+                      f"keys[{i}].public_key_b64 must be a non-empty string"
+                  )
+              else:
+                  try:
+                      raw = base64.b64decode(pub_b64, validate=True)
+                  except (binascii.Error, ValueError):
+                      raw = None
+                      errors.append(
+                          f"keys[{i}].public_key_b64 is not valid base64"
+                      )
+                  if raw is not None and len(raw) != 32:
+                      errors.append(
+                          f"keys[{i}].public_key_b64 must decode to 32 bytes "
+                          f"(Ed25519 public key); got {len(raw)}"
+                      )
+
+          if did_value and dir_name:
+              encoded = did_safe(did_value)
+              if encoded != dir_name:
+                  errors.append(
+                      f"`did` encoded as `{encoded}` does not match the "
+                      f"directory name `{dir_name}`"
+                  )
+
+          if errors:
+              detail = "\n".join(f"- {e}" for e in errors)
+              body = "\n".join([
+                  "## ✗ KBTransfer Registry Bot — Validation Failed",
+                  "",
+                  "**Failed check:** publisher_registration",
+                  "",
+                  detail,
+                  "",
+                  "Fix and push to this branch to re-trigger validation.  ",
+                  "See [REGISTRY_POLICY.md](./REGISTRY_POLICY.md) for "
+                  "requirements.",
+              ])
+              with open(".ci-artifacts/result_body.md", "w") as fh:
+                  fh.write(body)
+              print(body)
+              sys.exit(1)
+
+          body = "\n".join([
+              "## ✓ KBTransfer Registry Bot",
+              "",
+              "Publisher registration validated.",
+              "",
+              f"**DID:** `{did_value}`  ",
+              f"**Keys registered:** {len(keys_list)}  ",
+              f"**Directory:** `publishers/{dir_name}/`",
+              "",
+              "This PR will be auto-merged in 30 minutes.  ",
+              "To block merge, comment `/hold`.",
+          ])
+          with open(".ci-artifacts/result_body.md", "w") as fh:
+              fh.write(body)
+          print(body)
+          PY
+
+      - name: Post comment and apply label
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f .ci-artifacts/result_body.md ]; then
+            gh pr comment "$PR_NUMBER" --repo "$PR_REPO" \
+              --body-file .ci-artifacts/result_body.md
+          fi
+          if [ "${{ steps.validate.outcome }}" = "success" ]; then
+            gh pr edit "$PR_NUMBER" --repo "$PR_REPO" \
+              --add-label "registry-approved" || true
+          else
+            gh pr edit "$PR_NUMBER" --repo "$PR_REPO" \
+              --add-label "validation-failed" || true
+          fi
+
+  # ── Job 4 ────────────────────────────────────────────────────────────
+  validate_pack:
+    name: Validate pack submission
+    runs-on: ubuntu-latest
+    needs: detect_submission_type
+    if: needs.detect_submission_type.outputs.pack_path != ''
+    steps:
+      - name: Check out PR head with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install kbtransfer (provides kb_pack + kb_registry)
+        # NOTE: `reference/kb_pack` and `reference/kb_registry` do not
+        # each carry their own pyproject.toml — they ship together via
+        # the kbtransfer repo root wheel. Installing the root package
+        # in editable mode exposes both to Python.
+        run: pip install -e ./kbtransfer
+
+      - name: Install registry script dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run validate_pack.py
+        id: validate
+        env:
+          PACK_PATH: ${{ needs.detect_submission_type.outputs.pack_path }}
+        run: |
+          mkdir -p .ci-artifacts
+          set +e
+          python scripts/validate_pack.py "$PACK_PATH" \
+            > .ci-artifacts/report.json
+          RC=$?
+          set -e
+          cat .ci-artifacts/report.json
+          exit "$RC"
+
+      - name: Compose PR comment from report
+        if: always()
+        env:
+          PACK_PATH: ${{ needs.detect_submission_type.outputs.pack_path }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import tarfile
+
+          report_path = ".ci-artifacts/report.json"
+          pack_path = os.environ["PACK_PATH"]
+          try:
+              with open(report_path, "r", encoding="utf-8") as fh:
+                  report = json.load(fh)
+          except (FileNotFoundError, json.JSONDecodeError):
+              report = None
+
+          if report is None:
+              body = "\n".join([
+                  "## ✗ KBTransfer Registry Bot — Validation Failed",
+                  "",
+                  "**Failed check:** validator_crashed",
+                  "",
+                  "The validator produced unreadable output. Check the "
+                  "workflow logs for details.",
+                  "",
+                  "Fix and push to this branch to re-trigger validation.  ",
+                  "See [REGISTRY_POLICY.md](./REGISTRY_POLICY.md) for "
+                  "requirements.",
+              ])
+          elif report.get("overall") != "pass":
+              body = "\n".join([
+                  "## ✗ KBTransfer Registry Bot — Validation Failed",
+                  "",
+                  f"**Failed check:** {report.get('error_check') or 'unknown'}",
+                  "",
+                  report.get("error_detail") or "(no detail provided)",
+                  "",
+                  "Fix and push to this branch to re-trigger validation.  ",
+                  "See [REGISTRY_POLICY.md](./REGISTRY_POLICY.md) for "
+                  "requirements.",
+              ])
+          else:
+              # Extract the metadata the PASS template needs directly from
+              # the tarball. validate_pack.py's JSON doesn't carry
+              # license/domain/composite_score/experience details, so we
+              # re-open the archive here.
+              pack_id = report.get("pack_id", "")
+              version = report.get("version", "")
+              publisher_did = report.get("publisher_did", "")
+              expected_top = f"{pack_id}-{version}"
+
+              license_spdx = ""
+              domain = ""
+              composite_score = ""
+              experience_file = ""
+              word_count = 0
+              domain_re = re.compile(
+                  r"^\s*[Dd]omain\s*:\s*(.+?)\s*$", re.MULTILINE
+              )
+
+              with tarfile.open(pack_path, "r") as tar:
+                  candidates: list[tuple[str, int]] = []
+                  for member in tar.getmembers():
+                      parts = member.name.split("/")
+                      if len(parts) < 2 or parts[0] != expected_top:
+                          continue
+                      rel = "/".join(parts[1:])
+                      is_file = member.isfile()
+
+                      if rel == "pack.manifest.yaml" and is_file:
+                          f = tar.extractfile(member)
+                          if f is not None:
+                              text = f.read().decode("utf-8")
+                              # kb_pack v0.1.1 nested shape: license is a
+                              # mapping with an spdx: field. Use yaml.safe_load
+                              # to avoid brittle regex against YAML nesting.
+                              try:
+                                  import yaml as _yaml
+                                  doc = _yaml.safe_load(text)
+                                  if isinstance(doc, dict):
+                                      lic = doc.get("license")
+                                      if isinstance(lic, dict):
+                                          spdx = lic.get("spdx")
+                                          if isinstance(spdx, str) and spdx.strip():
+                                              license_spdx = spdx.strip()
+                              except Exception:
+                                  pass
+                      elif rel == "pages/README.md" and is_file:
+                          f = tar.extractfile(member)
+                          if f is not None:
+                              text = f.read().decode("utf-8", errors="replace")
+                              m = domain_re.search(text)
+                              if m:
+                                  domain = m.group(1).strip()
+                      elif rel == "attestations/evaluation.json" and is_file:
+                          f = tar.extractfile(member)
+                          if f is not None:
+                              try:
+                                  doc = json.loads(f.read().decode("utf-8"))
+                                  score = doc.get("composite_score")
+                                  if isinstance(score, (int, float)) and not isinstance(score, bool):
+                                      composite_score = f"{float(score):.2f}"
+                              except json.JSONDecodeError:
+                                  pass
+                      if is_file and (
+                          rel.startswith("pages/decisions/")
+                          or rel.startswith("pages/failure-log/")
+                      ):
+                          f = tar.extractfile(member)
+                          if f is not None:
+                              wc = len(
+                                  f.read().decode("utf-8", errors="replace").split()
+                              )
+                              candidates.append((rel, wc))
+
+                  if candidates:
+                      # Prefer the first file that met the validator's
+                      # threshold; ties broken by path sort order.
+                      over_threshold = [c for c in candidates if c[1] >= 100]
+                      chosen = sorted(over_threshold)[0] if over_threshold else sorted(candidates, key=lambda c: -c[1])[0]
+                      experience_file, word_count = chosen
+
+              lines = [
+                  "## ✓ KBTransfer Registry Bot",
+                  "",
+                  "All 7 checks passed.",
+                  "",
+                  f"**Pack:** {pack_id}@{version}  ",
+                  f"**Publisher:** {publisher_did}  ",
+                  f"**License:** {license_spdx or '(not declared)'}  ",
+                  f"**Domain:** {domain or '(not declared)'}  ",
+                  f"**Experience content:** "
+                  f"{experience_file or '(none)'} ({word_count} words)  ",
+                  f"**Composite score:** {composite_score or 'n/a'}",
+                  "",
+                  "This PR will be auto-merged in 30 minutes.  ",
+                  "To block merge, comment `/hold`.",
+              ]
+              body = "\n".join(lines)
+
+          with open(".ci-artifacts/result_body.md", "w", encoding="utf-8") as fh:
+              fh.write(body)
+          print(body)
+          PY
+
+      - name: Post comment and apply label
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f .ci-artifacts/result_body.md ]; then
+            gh pr comment "$PR_NUMBER" --repo "$PR_REPO" \
+              --body-file .ci-artifacts/result_body.md
+          fi
+          if [ "${{ steps.validate.outcome }}" = "success" ]; then
+            gh pr edit "$PR_NUMBER" --repo "$PR_REPO" \
+              --add-label "registry-approved" || true
+          else
+            gh pr edit "$PR_NUMBER" --repo "$PR_REPO" \
+              --add-label "validation-failed" || true
+          fi
+
+  # ── Job 5 ────────────────────────────────────────────────────────────
+  auto_merge:
+    name: Wait 30m, then auto-merge unless /hold
+    runs-on: ubuntu-latest
+    needs: [validate_publisher, validate_pack]
+    # GitHub Actions `needs:` is AND-only. We emulate "validate_pack OR
+    # validate_publisher passed" by always running the job and filtering
+    # inside: proceed only if at least one validator succeeded and
+    # neither actively failed.
+    if: >-
+      always() &&
+      (needs.validate_publisher.result == 'success' ||
+       needs.validate_pack.result == 'success') &&
+      needs.validate_publisher.result != 'failure' &&
+      needs.validate_pack.result != 'failure'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Wait 30 minutes
+        run: sleep 1800
+
+      - name: Check for /hold and merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Count comments whose body has a line starting with "/hold".
+          HOLD_COUNT=$(
+            gh api "/repos/$PR_REPO/issues/$PR_NUMBER/comments" --paginate \
+              --jq '.[].body' \
+            | grep -cE '(^|[[:space:]])/hold([[:space:]]|$)' \
+            || echo 0
+          )
+          if [ "${HOLD_COUNT:-0}" -gt 0 ]; then
+            gh pr comment "$PR_NUMBER" --repo "$PR_REPO" --body \
+              "## :no_entry: Merge blocked.
+
+          A \`/hold\` comment was found on this PR; auto-merge was cancelled.
+          Remove or resolve the hold and re-run the workflow to retry."
+            exit 0
+          fi
+          gh pr merge "$PR_NUMBER" --repo "$PR_REPO" \
+            --squash --delete-branch --subject "chore: $(gh pr view "$PR_NUMBER" --repo "$PR_REPO" --json title --jq .title)"

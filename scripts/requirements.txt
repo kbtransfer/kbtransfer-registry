@@ -1,0 +1,36 @@
+# Registry CI + local-dev dependencies for:
+#   - scripts/validate_pack.py
+#   - scripts/rebuild_index.py
+#   - scripts/test_validate_pack.py
+#
+# `kb_pack` and `kb_registry` are NOT listed here — they come from the
+# `kbtransfer` git submodule at registry-repo/kbtransfer/. Full setup:
+#
+#     git submodule update --init --recursive
+#     pip install -e ./kbtransfer
+#     pip install -r scripts/requirements.txt
+#
+# Pinning policy:
+#   `==`  for cryptographic / signature-verification libraries. An
+#         unexpected upgrade that alters signing behavior silently
+#         breaks verification of every previously-published pack, so
+#         upgrades are intentional PRs, never floating.
+#   `>=`  for everything else. A minor-version floor is enforced
+#         where the scripts rely on features added in that release.
+
+# ── Runtime: manifest / index parsing + semver ────────────────────────
+pyyaml>=6.0
+packaging>=23.0
+
+# ── Runtime: cryptography (signature verification) ────────────────────
+# Also a transitive dep of kbtransfer's kb_pack. Listed explicitly here
+# with an exact pin so the registry's CI run and a publisher's local
+# verify run cannot diverge on which `cryptography` actually signed or
+# verified. Bumps to this line must land as their own PR with a rebuild
+# of every pack that still verifies.
+cryptography==44.0.1
+
+# ── Test-only ─────────────────────────────────────────────────────────
+# scripts/test_validate_pack.py is run in CI and locally. Pinning the
+# pytest major floor is enough; plugin churn below it is not our risk.
+pytest>=8.0
