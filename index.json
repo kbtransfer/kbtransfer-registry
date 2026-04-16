@@ -1,1 +1,26 @@
-{"generated_at":"","pack_count":0,"packs":[]}
+{
+  "generated_at": "2026-04-16T18:08:18+03:00",
+  "pack_count": 1,
+  "packs": [
+    {
+      "added_at": "2026-04-16T18:08:18+03:00",
+      "cite_count": 0,
+      "composite_score": 0.82,
+      "content_root": "sha256:03be47740d1cdfbfb15a8e3c88a96bb2cc21195cd96730b0e43973d8cd43e59d",
+      "domain": "distributed-systems",
+      "has_decisions": true,
+      "has_failure_log": true,
+      "latest_version": "1.0.0",
+      "license": "MIT",
+      "pack_id": "test.patterns.circuit-breaker",
+      "publisher_did": "did:web:test.example",
+      "sha256": "11170f95ffbf96fa2663c3fdf74ffd87801cac0937e84518439d55c7fb932549",
+      "subscribe_count": 0,
+      "updated_at": "2026-04-16T18:08:18+03:00",
+      "versions": [
+        "1.0.0"
+      ]
+    }
+  ],
+  "publisher_count": 1
+}

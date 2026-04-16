@@ -1,1 +1,21 @@
-{"generated_at":"","publishers":{},"packs":{}}
+{
+  "generated_at": "2026-04-16T18:08:18+03:00",
+  "packs": {
+    "test.patterns.circuit-breaker": {
+      "cite_count": 0,
+      "subscribe_count": 0
+    }
+  },
+  "publishers": {
+    "did:web:test.example": {
+      "domains": [
+        "distributed-systems"
+      ],
+      "first_published": "2026-04-16T18:08:18+03:00",
+      "last_published": "2026-04-16T18:08:18+03:00",
+      "pack_count": 1,
+      "total_cite_count": 0,
+      "total_subscribe_count": 0
+    }
+  }
+}
