@@ -1,0 +1,10 @@
+{
+  "did": "did:web:test.example",
+  "keys": [
+    {
+      "key_id": "20260416-d57d3101",
+      "algorithm": "Ed25519",
+      "public_key_b64": "njw9AjUsAOpUUf7sk3Ud/pewXjkKTZQSOjdrfkvXpzE="
+    }
+  ]
+}
